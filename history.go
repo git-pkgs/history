@@ -6,11 +6,10 @@ package history
 import "github.com/go-git/go-git/v6/plumbing/cache"
 
 const (
-	readerBufferSize = 1 << 16
-	historyLookahead = 2
-
+	readerBufferSize    = 1 << 16
+	historyLookahead    = 2
 	defaultObjectBuffer = 64
-	defaultObjectBatch  = 64
+	defaultObjectBatch  = 1024
 )
 
 // Change is one file-level modification in a single commit, matching a raw
@@ -31,15 +30,12 @@ type Blob struct {
 }
 
 // Tuning controls go-git storage behaviour. The zero value matches go-git
-// defaults; only ObjectInfos defaults to true when applied.
+// defaults.
 type Tuning struct {
 	MemoryIndex   bool
 	Mmap          bool
 	CacheBytes    uint64
 	CacheShards   int
-	ObjectInfos   bool
-	ObjectBuffer  int
-	ObjectBatch   int
 	KlauspostZlib bool
 }
 
@@ -49,9 +45,6 @@ func DefaultTuning() Tuning {
 		Mmap:          true,
 		CacheBytes:    uint64(cache.DefaultMaxSize),
 		CacheShards:   1,
-		ObjectInfos:   true,
-		ObjectBuffer:  defaultObjectBuffer,
-		ObjectBatch:   defaultObjectBatch,
 		KlauspostZlib: true,
 	}
 }

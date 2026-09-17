@@ -2,16 +2,20 @@ package history
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
+	"os"
+	"path/filepath"
 	"sync"
 
 	"github.com/go-git/go-git/v6/plumbing"
 	"github.com/go-git/go-git/v6/storage/filesystem"
+	"github.com/go-git/go-git/v6/storage/filesystem/dotgit"
 )
 
 type blobTask struct {
-	info filesystem.ObjectInfo
+	info blobObjectInfo
 	oid  string
 }
 
@@ -19,54 +23,102 @@ type blobTask struct {
 // invokes visit from opts.Workers goroutines concurrently. visit must be
 // safe for concurrent use. The returned int is the total blob count
 // including those excluded by opts.Limit.
-func (r *Repo) WalkBlobs(opts BlobOptions, visit func(Blob) error) (int, error) {
-	if r.t.ObjectInfos {
-		return r.walkBlobsObjectInfos(opts, visit)
-	}
-	return r.walkBlobsObjects(opts, visit)
-}
-
-func (r *Repo) walkBlobsObjectInfos(opts BlobOptions, visit func(Blob) error) (int, error) {
-	storage, ok := r.r.Storer.(*filesystem.Storage)
-	if !ok {
-		return 0, fmt.Errorf("history: filesystem storage required for ObjectInfos")
-	}
-	iter, err := storage.IterObjectInfos(plumbing.BlobObject)
+func (r *Repo) WalkBlobs(opts BlobOptions, visit func(Blob) error) (total int, resultErr error) {
+	stores, err := r.objectStorages()
 	if err != nil {
 		return 0, err
 	}
-	defer iter.Close()
+	defer func() {
+		resultErr = errors.Join(resultErr, closeObjectStorages(stores[1:]))
+	}()
+
 	ctx, cancel := context.WithCancelCause(context.Background())
 	defer cancel(nil)
-	batchSize := max(1, r.t.ObjectBatch)
-	buffer := max(1, r.t.ObjectBuffer)
-	tasks := make(chan []blobTask, (buffer+batchSize-1)/batchSize)
+	tasks := make(chan []blobTask, max(1, defaultObjectBuffer/defaultObjectBatch))
 	var wg sync.WaitGroup
 	for range opts.workers() {
-		wg.Go(func() { readObjectInfoBatches(ctx, cancel, storage, tasks, visit) })
+		wg.Go(func() { r.readBlobTasks(ctx, cancel, tasks, visit) })
 	}
-	total, err := enumerateObjectInfos(ctx, iter, opts, batchSize, tasks)
+	total, err = r.enumerateBlobTasks(ctx, stores, opts, tasks)
 	close(tasks)
 	wg.Wait()
-	if cause := context.Cause(ctx); cause != nil && cause != context.Canceled {
+	if cause := context.Cause(ctx); cause != nil {
 		return total, cause
 	}
 	return total, err
 }
 
-func readObjectInfoBatches(ctx context.Context, fail context.CancelCauseFunc, storage *filesystem.Storage, tasks <-chan []blobTask, visit func(Blob) error) {
-	reader := storage.NewObjectInfoReader()
+func (r *Repo) objectStorages() ([]*filesystem.Storage, error) {
+	primary, ok := r.r.Storer.(*filesystem.Storage)
+	if !ok {
+		return nil, fmt.Errorf("history: unsupported storage %T", r.r.Storer)
+	}
+	stores := []*filesystem.Storage{primary}
+	options := dotgit.Options{
+		AlternatesFS: r.alternatesFS,
+		ObjectFormat: r.objectFormat,
+	}
+	queue := []*dotgit.DotGit{dotgit.NewWithOptions(primary.Filesystem(), options)}
+	seen := map[string]struct{}{filepath.Clean(primary.Filesystem().Root()): {}}
+	for len(queue) > 0 {
+		current := queue[0]
+		queue = queue[1:]
+		alternates, err := current.Alternates()
+		if errors.Is(err, os.ErrNotExist) {
+			continue
+		}
+		if err != nil {
+			return nil, errors.Join(err, closeObjectStorages(stores[1:]))
+		}
+		for _, alternate := range alternates {
+			fs := alternate.Fs()
+			root := filepath.Clean(fs.Root())
+			if _, ok := seen[root]; ok {
+				continue
+			}
+			seen[root] = struct{}{}
+			stores = append(stores, filesystem.NewStorageWithOptions(fs, r.objectCache, filesystem.Options{
+				AlternatesFS:   r.alternatesFS,
+				ObjectFormat:   r.objectFormat,
+				UseInMemoryIdx: r.t.MemoryIndex,
+			}))
+			queue = append(queue, dotgit.NewWithOptions(fs, options))
+		}
+	}
+	return stores, nil
+}
+
+func closeObjectStorages(stores []*filesystem.Storage) error {
+	var result error
+	for _, store := range stores {
+		result = errors.Join(result, store.Close())
+	}
+	return result
+}
+
+func (r *Repo) readBlobTasks(
+	ctx context.Context,
+	fail context.CancelCauseFunc,
+	tasks <-chan []blobTask,
+	visit func(Blob) error,
+) {
+	reader := newBlobObjectReader()
 	defer func() {
-		if err := reader.Close(); err != nil {
+		if err := reader.close(); err != nil {
 			fail(err)
 		}
 	}()
 	for batch := range tasks {
+		reader.clear()
 		for _, task := range batch {
 			if ctx.Err() != nil {
 				return
 			}
-			if err := visitObjectInfo(reader, task, visit); err != nil {
+			data, err := reader.read(task.info)
+			if err == nil {
+				err = visit(Blob{OID: task.oid, Size: task.info.size, Data: data})
+			}
+			if err != nil {
 				fail(err)
 				return
 			}
@@ -74,125 +126,63 @@ func readObjectInfoBatches(ctx context.Context, fail context.CancelCauseFunc, st
 	}
 }
 
-func visitObjectInfo(reader *filesystem.ObjectInfoReader, task blobTask, visit func(Blob) error) error {
-	obj, err := reader.EncodedObject(task.info)
-	if err != nil {
-		return err
+func sendBlobBatch(ctx context.Context, tasks chan<- []blobTask, batch []blobTask) bool {
+	if len(batch) == 0 {
+		return true
 	}
-	if obj.Size() != task.info.Size {
-		return fmt.Errorf("object %s size changed during enumeration: %d != %d", task.info.Hash, obj.Size(), task.info.Size)
-	}
-	data, err := readBlob(obj)
-	if err != nil {
-		return err
-	}
-	return visit(Blob{OID: task.oid, Size: task.info.Size, Data: data})
-}
-
-func enumerateObjectInfos(ctx context.Context, iter filesystem.ObjectInfoIter, opts BlobOptions, batchSize int, tasks chan<- []blobTask) (int, error) {
-	total := 0
-	batch := make([]blobTask, 0, batchSize)
-	flush := func() bool {
-		if len(batch) == 0 {
-			return true
-		}
-		select {
-		case tasks <- batch:
-			batch = make([]blobTask, 0, batchSize)
-			return true
-		case <-ctx.Done():
-			return false
-		}
-	}
-	for {
-		info, err := iter.Next()
-		if err == io.EOF {
-			flush()
-			return total, nil
-		}
-		if err != nil {
-			return total, err
-		}
-		total++
-		oid := info.Hash.String()
-		if info.Size > opts.limit(oid) {
-			opts.skip(oid)
-			continue
-		}
-		batch = append(batch, blobTask{info: info, oid: oid})
-		if len(batch) == batchSize && !flush() {
-			return total, nil
-		}
+	select {
+	case tasks <- batch:
+		return true
+	case <-ctx.Done():
+		return false
 	}
 }
 
-func (r *Repo) walkBlobsObjects(opts BlobOptions, visit func(Blob) error) (int, error) {
-	iter, err := r.r.Storer.IterEncodedObjects(plumbing.BlobObject)
+func appendBlobTask(
+	ctx context.Context,
+	tasks chan<- []blobTask,
+	batch []blobTask,
+	task blobTask,
+) ([]blobTask, bool) {
+	batch = append(batch, task)
+	if len(batch) < defaultObjectBatch {
+		return batch, true
+	}
+	if !sendBlobBatch(ctx, tasks, batch) {
+		return nil, false
+	}
+	return make([]blobTask, 0, defaultObjectBatch), true
+
+}
+
+func (r *Repo) enumerateBlobTasks(
+	ctx context.Context,
+	stores []*filesystem.Storage,
+	opts BlobOptions,
+	tasks chan<- []blobTask,
+) (int, error) {
+	infos, err := blobObjectInfos(stores, r.objectFormat)
 	if err != nil {
 		return 0, err
 	}
-	defer iter.Close()
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-	objects := make(chan plumbing.EncodedObject)
-	var wg sync.WaitGroup
-	var once sync.Once
-	var readErr error
-	for range opts.workers() {
-		wg.Go(func() {
-			for obj := range objects {
-				data, err := readBlob(obj)
-				if err != nil {
-					once.Do(func() { readErr = err; cancel() })
-					return
-				}
-				if err := visit(Blob{OID: obj.Hash().String(), Size: obj.Size(), Data: data}); err != nil {
-					once.Do(func() { readErr = err; cancel() })
-					return
-				}
-			}
-		})
-	}
-	total := 0
-enumerate:
-	for {
-		var obj plumbing.EncodedObject
-		obj, err = iter.Next()
-		if err == io.EOF {
-			err = nil
-			break
-		}
-		if err != nil {
-			break
-		}
-		total++
-		oid := obj.Hash().String()
-		if obj.Size() > opts.limit(oid) {
+	batch := make([]blobTask, 0, defaultObjectBatch)
+	for index, info := range infos {
+		oid := info.hash.String()
+		if info.size > opts.limit(oid) {
 			opts.skip(oid)
 			continue
 		}
-		select {
-		case objects <- obj:
-		case <-ctx.Done():
-			break enumerate
+		var ok bool
+		batch, ok = appendBlobTask(ctx, tasks, batch, blobTask{info: info, oid: oid})
+		if !ok {
+			return index + 1, nil
 		}
 	}
-	close(objects)
-	wg.Wait()
-	if readErr != nil {
-		return total, readErr
-	}
-	return total, err
+	sendBlobBatch(ctx, tasks, batch)
+	return len(infos), nil
 }
 
 func readBlob(obj plumbing.EncodedObject) ([]byte, error) {
-	if memory, ok := obj.(interface{ Bytes() []byte }); ok {
-		data := memory.Bytes()
-		if int64(len(data)) != obj.Size() {
-			return nil, fmt.Errorf("memory object size mismatch: %d != %d", len(data), obj.Size())
-		}
-		return data, nil
-	}
 	reader, err := obj.Reader()
 	if err != nil {
 		return nil, err

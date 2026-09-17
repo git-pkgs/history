@@ -1,7 +1,10 @@
 package history
 
 import (
+	"bytes"
 	"errors"
+	"fmt"
+	"maps"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -14,10 +17,15 @@ import (
 
 	"github.com/go-git/go-git/v6/plumbing"
 	"github.com/go-git/go-git/v6/plumbing/filemode"
+	formatcfg "github.com/go-git/go-git/v6/plumbing/format/config"
 	"github.com/go-git/go-git/v6/plumbing/object"
 )
 
-const testMainBranch = "main"
+const (
+	testMainBranch = "main"
+	testSHA1       = "sha1"
+	testSHA256     = "sha256"
+)
 
 func TestDefaultTuningUsesFastReaders(t *testing.T) {
 	tuning := DefaultTuning()
@@ -148,6 +156,45 @@ func TestWalkChangesReturnsVisitorError(t *testing.T) {
 		if !errors.Is(err, want) || visits != 1 {
 			t.Fatalf("workers=%d: visits=%d err=%v", workers, visits, err)
 		}
+	}
+}
+
+func TestWalkChangesSHA256MatchesGit(t *testing.T) {
+	repo := repository(t, "--object-format=sha256")
+	commitFile(t, repo, "a.txt", "one\n", "add a")
+	commitFile(t, repo, "dir/b.txt", "two\n", "add b")
+	commitFile(t, repo, "a.txt", "three\n", "modify a")
+	git(t, repo, "gc", "--quiet")
+
+	key := func(change Change) string {
+		return strings.Join([]string{
+			change.Commit,
+			change.Path,
+			change.OldOID,
+			change.NewOID,
+			change.OldMode,
+			change.NewMode,
+		}, "|")
+	}
+	var want []string
+	if err := WalkChangesGit(repo, false, func(change Change) error {
+		want = append(want, key(change))
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	r := open(t, repo)
+	var got []string
+	if err := r.WalkChanges(ChangeOptions{Workers: 2}, func(change Change) error {
+		got = append(got, key(change))
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	sort.Strings(want)
+	sort.Strings(got)
+	if !slices.Equal(got, want) {
+		t.Fatalf("changes=%v, want %v", got, want)
 	}
 }
 
@@ -283,38 +330,30 @@ func TestWalkBlobs(t *testing.T) {
 	commitFile(t, repo, "a.txt", "gamma\n", "three")
 	git(t, repo, "gc")
 
-	for _, infos := range []bool{true, false} {
-		tune := DefaultTuning()
-		tune.ObjectInfos = infos
-		r, err := OpenWithOptions(repo, OpenOptions{Tuning: tune})
-		if err != nil {
-			t.Fatal(err)
-		}
-		var mu sync.Mutex
-		got := map[string]string{}
-		total, err := r.WalkBlobs(BlobOptions{Workers: 3}, func(b Blob) error {
-			mu.Lock()
-			got[b.OID] = string(b.Data)
-			mu.Unlock()
-			return nil
-		})
-		_ = r.Close()
-		if err != nil {
-			t.Fatalf("infos=%v: %v", infos, err)
-		}
-		if total != 3 || len(got) != 3 {
-			t.Fatalf("infos=%v: total=%d unique=%d, want 3", infos, total, len(got))
-		}
-		for _, want := range []string{"alpha\n", "beta\n", "gamma\n"} {
-			found := false
-			for _, v := range got {
-				if v == want {
-					found = true
-				}
+	r := open(t, repo)
+	var mu sync.Mutex
+	got := map[string]string{}
+	total, err := r.WalkBlobs(BlobOptions{Workers: 3}, func(b Blob) error {
+		mu.Lock()
+		got[b.OID] = string(b.Data)
+		mu.Unlock()
+		return nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if total != 3 || len(got) != 3 {
+		t.Fatalf("total=%d unique=%d, want 3", total, len(got))
+	}
+	for _, want := range []string{"alpha\n", "beta\n", "gamma\n"} {
+		found := false
+		for _, value := range got {
+			if value == want {
+				found = true
 			}
-			if !found {
-				t.Fatalf("infos=%v: missing blob content %q in %v", infos, want, got)
-			}
+		}
+		if !found {
+			t.Fatalf("missing blob content %q in %v", want, got)
 		}
 	}
 }
@@ -346,6 +385,66 @@ func TestWalkBlobsLimit(t *testing.T) {
 	}
 	if total != 2 || len(visited) != 1 || len(skipped) != 1 {
 		t.Fatalf("total=%d visited=%d skipped=%d", total, len(visited), len(skipped))
+	}
+}
+
+func TestWalkBlobsObjectFormats(t *testing.T) {
+	for _, format := range []string{testSHA1, testSHA256} {
+		t.Run(format, func(t *testing.T) {
+			repo := repository(t, "--object-format="+format)
+			for version := range 20 {
+				content := bytes.Repeat([]byte{'a' + byte(version%5)}, 128<<10)
+				copy(content[version*100:], fmt.Appendf(nil, "version %d", version))
+				commitFile(t, repo, "data.bin", string(content), fmt.Sprintf("version %d", version))
+			}
+			git(t, repo, "gc", "--aggressive", "--quiet")
+
+			r := open(t, repo)
+			hasher := plumbing.FromObjectFormat(r.objectFormat)
+			visited := 0
+			total, err := r.WalkBlobs(BlobOptions{Workers: 4}, func(blob Blob) error {
+				hash, err := hasher.Compute(plumbing.BlobObject, blob.Data)
+				if err != nil {
+					return err
+				}
+				if hash.String() != blob.OID || int64(len(blob.Data)) != blob.Size {
+					t.Fatalf("blob %s decoded as %s with size %d/%d", blob.OID, hash, len(blob.Data), blob.Size)
+				}
+				visited++
+				return nil
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if total != 20 || visited != total {
+				t.Fatalf("total=%d visited=%d, want 20", total, visited)
+			}
+		})
+	}
+}
+
+func TestObjectCacheShardsAndClears(t *testing.T) {
+	object := plumbing.NewMemoryObject(plumbing.FromObjectFormat(formatcfg.SHA1))
+	object.SetType(plumbing.BlobObject)
+	writer, err := object.Writer()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := writer.Write([]byte("content")); err != nil {
+		t.Fatal(err)
+	}
+	if err := writer.Close(); err != nil {
+		t.Fatal(err)
+	}
+	objectCache := newObjectCache(1<<20, 4)
+	objectCache.Put(object)
+	got, ok := objectCache.Get(object.Hash())
+	if !ok || got != object {
+		t.Fatal("cache missed stored object")
+	}
+	objectCache.Clear()
+	if _, ok := objectCache.Get(object.Hash()); ok {
+		t.Fatal("cache retained object after Clear")
 	}
 }
 
@@ -471,35 +570,96 @@ func TestOpenAlternates(t *testing.T) {
 		t.Fatalf("changes=%d, want 2", changes)
 	}
 
-	for _, infos := range []bool{true, false} {
-		tuning := DefaultTuning()
-		tuning.ObjectInfos = infos
-		blobRepo, err := OpenWithOptions(shared, OpenOptions{Tuning: tuning})
+	blobRepo := open(t, shared)
+	var mu sync.Mutex
+	contents := make(map[string]struct{})
+	total, err := blobRepo.WalkBlobs(BlobOptions{Workers: 2}, func(blob Blob) error {
+		mu.Lock()
+		contents[string(blob.Data)] = struct{}{}
+		mu.Unlock()
+		return nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if total != 2 || len(contents) != 2 {
+		t.Fatalf("total=%d contents=%v, want 2", total, contents)
+	}
+	for _, want := range []string{"x", "y"} {
+		if _, ok := contents[want]; !ok {
+			t.Fatalf("missing %q in %v", want, contents)
+		}
+	}
+}
+
+func TestOpenNestedAlternates(t *testing.T) {
+	repo := repository(t)
+	commitFile(t, repo, "a.txt", "x", "one")
+	commitFile(t, repo, "a.txt", "y", "two")
+	git(t, repo, "gc", "--quiet")
+
+	middle := filepath.Join(t.TempDir(), "middle")
+	git(t, repo, "clone", "--shared", repo, middle)
+	shared := filepath.Join(t.TempDir(), "shared")
+	git(t, middle, "clone", "--shared", middle, shared)
+	alternates := filepath.Join(shared, ".git", "objects", "info", "alternates")
+	file, err := os.OpenFile(alternates, os.O_APPEND|os.O_WRONLY, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, writeErr := fmt.Fprintf(file, "%s\n", filepath.Join(repo, ".git", "objects"))
+	closeErr := file.Close()
+	if writeErr != nil || closeErr != nil {
+		t.Fatal(errors.Join(writeErr, closeErr))
+	}
+
+	r := open(t, shared)
+	changes := 0
+	if err := r.WalkChanges(ChangeOptions{}, func(Change) error {
+		changes++
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if changes != 2 {
+		t.Fatalf("changes=%d, want 2", changes)
+	}
+
+	var mu sync.Mutex
+	contents := make(map[string]int)
+	total, err := r.WalkBlobs(BlobOptions{Workers: 2}, func(blob Blob) error {
+		mu.Lock()
+		contents[string(blob.Data)]++
+		mu.Unlock()
+		return nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if total != 2 || !maps.Equal(contents, map[string]int{"x": 1, "y": 1}) {
+		t.Fatalf("total=%d contents=%v, want each blob once", total, contents)
+	}
+}
+
+func TestParseTreeMode(t *testing.T) {
+	for input, want := range map[string]filemode.FileMode{
+		"40000":  filemode.Dir,
+		"100644": filemode.Regular,
+		"100755": filemode.Executable,
+		"120000": filemode.Symlink,
+		"160000": filemode.Submodule,
+	} {
+		got, err := parseTreeMode([]byte(input))
 		if err != nil {
-			t.Fatal(err)
+			t.Fatalf("parseTreeMode(%q): %v", input, err)
 		}
-		var mu sync.Mutex
-		contents := make(map[string]struct{})
-		total, err := blobRepo.WalkBlobs(BlobOptions{Workers: 2}, func(blob Blob) error {
-			mu.Lock()
-			contents[string(blob.Data)] = struct{}{}
-			mu.Unlock()
-			return nil
-		})
-		closeErr := blobRepo.Close()
-		if err != nil {
-			t.Fatalf("infos=%v: %v", infos, err)
+		if got != want {
+			t.Fatalf("parseTreeMode(%q)=%o, want %o", input, got, want)
 		}
-		if closeErr != nil {
-			t.Fatalf("infos=%v close: %v", infos, closeErr)
-		}
-		if total != 2 || len(contents) != 2 {
-			t.Fatalf("infos=%v: total=%d contents=%v, want 2", infos, total, contents)
-		}
-		for _, want := range []string{"x", "y"} {
-			if _, ok := contents[want]; !ok {
-				t.Fatalf("infos=%v: missing %q in %v", infos, want, contents)
-			}
+	}
+	for _, input := range []string{"", "8", "10064x", "10064444"} {
+		if _, err := parseTreeMode([]byte(input)); err == nil {
+			t.Fatalf("parseTreeMode(%q) succeeded", input)
 		}
 	}
 }
@@ -563,7 +723,7 @@ func TestVisitCommitTrees(t *testing.T) {
 }
 
 func TestRawCommitLinksMatchDecodedCommits(t *testing.T) {
-	for _, format := range []string{"sha1", "sha256"} {
+	for _, format := range []string{testSHA1, testSHA256} {
 		t.Run(format, func(t *testing.T) {
 			repo := repository(t, "--object-format="+format)
 			commitFile(t, repo, "base.txt", "base\n", "base")
@@ -599,7 +759,7 @@ func TestRawCommitLinksMatchDecodedCommits(t *testing.T) {
 }
 
 func TestWalkTreeEntriesMatchesDecodedTree(t *testing.T) {
-	for _, format := range []string{"sha1", "sha256"} {
+	for _, format := range []string{testSHA1, testSHA256} {
 		t.Run(format, func(t *testing.T) {
 			repo := repository(t, "--object-format="+format)
 			commitFile(t, repo, "a.txt", "a\n", "add a")

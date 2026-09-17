@@ -1,18 +1,21 @@
 package history
 
 import (
+	"container/list"
 	"errors"
 	"fmt"
 	"io"
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 
 	"github.com/go-git/go-billy/v6"
 	"github.com/go-git/go-billy/v6/osfs"
 	gogit "github.com/go-git/go-git/v6"
 	"github.com/go-git/go-git/v6/plumbing"
 	"github.com/go-git/go-git/v6/plumbing/cache"
+	formatcfg "github.com/go-git/go-git/v6/plumbing/format/config"
 	"github.com/go-git/go-git/v6/plumbing/object"
 	"github.com/go-git/go-git/v6/storage/filesystem"
 	"github.com/go-git/go-git/v6/storage/filesystem/dotgit"
@@ -20,10 +23,13 @@ import (
 
 // Repo wraps an open go-git repository configured for history walking.
 type Repo struct {
-	r         *gogit.Repository
-	t         Tuning
-	gitDir    string
-	commonDir string
+	r            *gogit.Repository
+	t            Tuning
+	gitDir       string
+	commonDir    string
+	objectCache  cache.Object
+	alternatesFS billy.Filesystem
+	objectFormat formatcfg.ObjectFormat
 }
 
 // OpenOptions controls repository discovery and storage.
@@ -40,7 +46,7 @@ func Open(path string) (*Repo, error) {
 
 // OpenWithOptions opens the repository at path with repository discovery and
 // alternate-object storage options.
-func OpenWithOptions(path string, opts OpenOptions) (*Repo, error) {
+func OpenWithOptions(path string, opts OpenOptions) (*Repo, error) { //nolint:gocognit // repository compatibility checks are sequential
 	for _, name := range []string{"GIT_OBJECT_DIRECTORY", "GIT_ALTERNATE_OBJECT_DIRECTORIES"} {
 		if os.Getenv(name) != "" {
 			return nil, fmt.Errorf("history: go-git does not support %s", name)
@@ -66,7 +72,6 @@ func OpenWithOptions(path string, opts OpenOptions) (*Repo, error) {
 	}
 	r, err := gogit.PlainOpenWithOptions(path, &gogit.PlainOpenOptions{
 		DetectDotGit: opts.DetectDotGit,
-		AlternatesFS: alternatesFS,
 	})
 	if err != nil {
 		return nil, err
@@ -102,11 +107,21 @@ func OpenWithOptions(path string, opts OpenOptions) (*Repo, error) {
 		_ = r.Close()
 		return nil, err
 	}
-	if err := configure(r, opts.Tuning, alternatesFS); err != nil {
+	cfg, err := r.Config()
+	if err != nil {
 		_ = r.Close()
 		return nil, err
 	}
-	return &Repo{r: r, t: opts.Tuning, gitDir: gitDir, commonDir: commonDir}, nil
+	objectCache, err := configure(r, opts.Tuning, alternatesFS, cfg.Extensions.ObjectFormat)
+	if err != nil {
+		_ = r.Close()
+		return nil, err
+	}
+	return &Repo{
+		r: r, t: opts.Tuning, gitDir: gitDir, commonDir: commonDir,
+		objectCache: objectCache, alternatesFS: alternatesFS,
+		objectFormat: cfg.Extensions.ObjectFormat,
+	}, nil
 }
 
 // Close releases the underlying go-git repository.
@@ -166,18 +181,20 @@ func rejectReplacementRefs(r *gogit.Repository) error {
 	}
 }
 
-func configure(r *gogit.Repository, t Tuning, alternatesFS billy.Filesystem) error {
+func configure(
+	r *gogit.Repository,
+	t Tuning,
+	alternatesFS billy.Filesystem,
+	objectFormat formatcfg.ObjectFormat,
+) (*objectCache, error) {
 	if t.CacheBytes == 0 {
 		t.CacheBytes = uint64(cache.DefaultMaxSize)
-	}
-	if !t.MemoryIndex && !t.Mmap && t.CacheBytes == uint64(cache.DefaultMaxSize) && t.CacheShards <= 1 {
-		return nil
 	}
 	fs := r.Storer.(*filesystem.Storage).Filesystem()
 	if t.Mmap {
 		objects, err := fs.Chroot("objects")
 		if err != nil {
-			return err
+			return nil, err
 		}
 		fs = dotgit.NewRepositoryFilesystem(
 			osfs.New(fs.Root(), osfs.WithBoundOS(), osfs.WithMmap()),
@@ -185,17 +202,120 @@ func configure(r *gogit.Repository, t Tuning, alternatesFS billy.Filesystem) err
 		)
 	}
 	if err := r.Close(); err != nil {
-		return err
+		return nil, err
 	}
-	objectCache := cache.Object(cache.NewObjectLRU(cache.FileSize(t.CacheBytes)))
-	if t.CacheShards > 1 {
-		objectCache = cache.NewShardedObjectLRU(cache.FileSize(t.CacheBytes), t.CacheShards)
-	}
+	objectCache := newObjectCache(cache.FileSize(t.CacheBytes), t.CacheShards)
 	r.Storer = filesystem.NewStorageWithOptions(fs, objectCache, filesystem.Options{
 		AlternatesFS:   alternatesFS,
+		ObjectFormat:   objectFormat,
 		UseInMemoryIdx: t.MemoryIndex,
 	})
-	return nil
+	return objectCache, nil
+}
+
+type objectCache struct {
+	shards []*objectCacheShard
+}
+
+func newObjectCache(maxSize cache.FileSize, count int) *objectCache {
+	if count < 1 {
+		count = 1
+	}
+	result := &objectCache{shards: make([]*objectCacheShard, count)}
+	perShard := maxSize / cache.FileSize(count)
+	remainder := maxSize % cache.FileSize(count)
+	for i := range result.shards {
+		size := perShard
+		if cache.FileSize(i) < remainder {
+			size++
+		}
+		result.shards[i] = &objectCacheShard{
+			maxSize: size,
+			entries: make(map[plumbing.Hash]*list.Element),
+		}
+	}
+	return result
+}
+
+func (c *objectCache) shard(hash plumbing.Hash) *objectCacheShard {
+	return c.shards[int(hash.Bytes()[0])%len(c.shards)]
+}
+
+func (c *objectCache) Put(encoded plumbing.EncodedObject) {
+	hash := encoded.Hash()
+	c.shard(hash).put(hash, encoded)
+}
+
+func (c *objectCache) Get(hash plumbing.Hash) (plumbing.EncodedObject, bool) { //nolint:ireturn // cache.Object contract
+	return c.shard(hash).get(hash)
+}
+
+func (c *objectCache) Clear() {
+	for _, shard := range c.shards {
+		shard.clear()
+	}
+}
+
+type objectCacheShard struct {
+	maxSize cache.FileSize
+	size    cache.FileSize
+	entries map[plumbing.Hash]*list.Element
+	list    list.List
+	mu      sync.Mutex
+}
+
+type objectCacheEntry struct {
+	key    plumbing.Hash
+	object plumbing.EncodedObject
+}
+
+func (c *objectCacheShard) put(key plumbing.Hash, object plumbing.EncodedObject) {
+	size := cache.FileSize(object.Size())
+	if size > c.maxSize {
+		return
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if element := c.entries[key]; element != nil {
+		entry := element.Value.(*objectCacheEntry)
+		c.size += size - cache.FileSize(entry.object.Size())
+		entry.object = object
+		c.list.MoveToFront(element)
+	} else {
+		entry := &objectCacheEntry{key: key, object: object}
+		c.entries[key] = c.list.PushFront(entry)
+		c.size += size
+	}
+	for c.size > c.maxSize {
+		element := c.list.Back()
+		if element == nil {
+			c.size = 0
+			break
+		}
+		entry := element.Value.(*objectCacheEntry)
+		c.size -= cache.FileSize(entry.object.Size())
+		delete(c.entries, entry.key)
+		c.list.Remove(element)
+	}
+}
+
+func (c *objectCacheShard) get(key plumbing.Hash) (plumbing.EncodedObject, bool) { //nolint:ireturn // entries contain EncodedObject values
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	element := c.entries[key]
+	if element == nil {
+		return nil, false
+	}
+	c.list.MoveToFront(element)
+	return element.Value.(*objectCacheEntry).object, true
+}
+
+func (c *objectCacheShard) clear() {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.size = 0
+	c.entries = make(map[plumbing.Hash]*list.Element)
+	c.list.Init()
 }
 
 func historyRoots(r *gogit.Repository) ([]plumbing.Hash, error) {

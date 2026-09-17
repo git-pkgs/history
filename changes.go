@@ -192,7 +192,7 @@ func (r *Repo) visitCommitNodeChanges(ctx context.Context, node commitgraph.Comm
 	date := commit.Author.When.Format(time.RFC3339)
 	subject := CommitSubject(commit.Message)
 	merge := len(parents) > 1
-	return object.WalkTreeDiffContext(ctx, r.r.Storer, from, to, func(entry object.TreeDiffChange) error {
+	return walkTreeDiffContext(ctx, r.r.Storer, from, to, func(entry treeDiffChange) error {
 		oldOID, newOID := zero, zero
 		if !entry.From.Hash.IsZero() {
 			oldOID = entry.From.Hash.String()
