@@ -5,7 +5,7 @@ go 1.26.0
 require (
 	github.com/go-git/go-billy/v6 v6.0.0-alpha.2
 	github.com/go-git/go-git/v6 v6.0.0-alpha.4
-	github.com/klauspost/compress v1.19.2
+	github.com/klauspost/compress v1.20.0
 )
 
 require (
