@@ -70,11 +70,6 @@ func readCommitTreeAndParents(r *gogit.Repository, hash plumbing.Hash, includePa
 	if encoded.Type() != plumbing.CommitObject {
 		return tree, fmt.Errorf("object %s is %s, want commit", hash, encoded.Type())
 	}
-	if memory, ok := encoded.(*plumbing.MemoryObject); ok {
-		writer := commitLinksWriter{hash: hash, includeParents: includeParents, parents: parents}
-		_, err := memory.WriteTo(&writer)
-		return writer.tree, err
-	}
 	reader, err := encoded.Reader()
 	if err != nil {
 		return tree, err
@@ -129,42 +124,6 @@ func readCommitTreeAndParents(r *gogit.Repository, hash plumbing.Hash, includePa
 			return tree, nil
 		}
 	}
-}
-
-type commitLinksWriter struct {
-	hash           plumbing.Hash
-	tree           plumbing.Hash
-	includeParents bool
-	parents        *[]plumbing.Hash
-}
-
-func (w *commitLinksWriter) Write(data []byte) (int, error) {
-	line, rest, _ := bytes.Cut(data, []byte{'\n'})
-	value, ok := bytes.CutPrefix(line, []byte("tree "))
-	if !ok {
-		return 0, fmt.Errorf("commit %s has no leading tree header", w.hash)
-	}
-	tree, err := parseCommitObjectID(value, w.hash.Size())
-	if err != nil {
-		return 0, fmt.Errorf("commit %s tree: %w", w.hash, err)
-	}
-	w.tree = tree
-	for len(rest) > 0 {
-		line, next, _ := bytes.Cut(rest, []byte{'\n'})
-		value, ok = bytes.CutPrefix(line, []byte("parent "))
-		if !ok {
-			break
-		}
-		parent, err := parseCommitObjectID(value, w.hash.Size())
-		if err != nil {
-			return 0, fmt.Errorf("commit %s parent: %w", w.hash, err)
-		}
-		if w.includeParents {
-			*w.parents = append(*w.parents, parent)
-		}
-		rest = next
-	}
-	return len(data), nil
 }
 
 func parseCommitObjectID(value []byte, size int) (plumbing.Hash, error) {

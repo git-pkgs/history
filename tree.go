@@ -2,13 +2,14 @@ package history
 
 import (
 	"bufio"
-	"bytes"
 	"fmt"
 	"io"
 
 	"github.com/go-git/go-git/v6/plumbing"
 	"github.com/go-git/go-git/v6/plumbing/filemode"
 )
+
+const treeModeBase = 8
 
 // TreeEntry is one immediate child of a Git tree. Name is valid only until
 // the visitor returns and must be copied if retained.
@@ -27,9 +28,6 @@ func (r *Repo) WalkTreeEntries(hash plumbing.Hash, visit func(TreeEntry) error) 
 	}
 	if encoded.Type() != plumbing.TreeObject {
 		return fmt.Errorf("object %s is %s, want tree", hash, encoded.Type())
-	}
-	if memory, ok := encoded.(*plumbing.MemoryObject); ok {
-		return walkTreeEntryBytes(hash, memory.Bytes(), visit)
 	}
 	reader, err := encoded.Reader()
 	if err != nil {
@@ -55,7 +53,7 @@ func (r *Repo) WalkTreeEntries(hash plumbing.Hash, visit func(TreeEntry) error) 
 		if err != nil {
 			return fmt.Errorf("tree %s mode: %w", hash, err)
 		}
-		mode, err := filemode.FromBytes(modeBytes[:len(modeBytes)-1])
+		mode, err := parseTreeMode(modeBytes[:len(modeBytes)-1])
 		if err != nil {
 			return fmt.Errorf("tree %s mode: %w", hash, err)
 		}
@@ -84,37 +82,16 @@ func (r *Repo) WalkTreeEntries(hash plumbing.Hash, visit func(TreeEntry) error) 
 	}
 }
 
-func walkTreeEntryBytes(hash plumbing.Hash, data []byte, visit func(TreeEntry) error) error {
-	for len(data) > 0 {
-		modeEnd := bytes.IndexByte(data, ' ')
-		if modeEnd < 0 {
-			return fmt.Errorf("tree %s mode: %w", hash, io.ErrUnexpectedEOF)
-		}
-		mode, err := filemode.FromBytes(data[:modeEnd])
-		if err != nil {
-			return fmt.Errorf("tree %s mode: %w", hash, err)
-		}
-		data = data[modeEnd+1:]
-		nameEnd := bytes.IndexByte(data, 0)
-		if nameEnd < 0 {
-			return fmt.Errorf("tree %s name: %w", hash, io.ErrUnexpectedEOF)
-		}
-		name := data[:nameEnd]
-		if len(name) == 0 {
-			return fmt.Errorf("tree %s has an empty filename", hash)
-		}
-		data = data[nameEnd+1:]
-		if len(data) < hash.Size() {
-			return fmt.Errorf("tree %s object ID: %w", hash, io.ErrUnexpectedEOF)
-		}
-		oid, ok := plumbing.FromBytes(data[:hash.Size()])
-		if !ok {
-			return fmt.Errorf("tree %s has an invalid object ID", hash)
-		}
-		if err := visit(TreeEntry{Name: name, Hash: oid, Mode: mode}); err != nil {
-			return err
-		}
-		data = data[hash.Size():]
+func parseTreeMode(data []byte) (filemode.FileMode, error) {
+	if len(data) == 0 || len(data) > 7 {
+		return filemode.Empty, fmt.Errorf("invalid mode %q", data)
 	}
-	return nil
+	var mode uint32
+	for _, digit := range data {
+		if digit < '0' || digit > '7' {
+			return filemode.Empty, fmt.Errorf("invalid mode %q", data)
+		}
+		mode = mode*treeModeBase + uint32(digit-'0')
+	}
+	return filemode.FileMode(mode), nil
 }

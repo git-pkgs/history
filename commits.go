@@ -187,7 +187,7 @@ func (r *Repo) readCommit(
 	date := commit.Author.When.Format(time.RFC3339)
 	subject := CommitSubject(commit.Message)
 	merge := len(commit.ParentHashes) > 1
-	err = object.WalkTreeDiffContext(ctx, r.r.Storer, fromHash, toHash, func(entry object.TreeDiffChange) error {
+	err = walkTreeDiffContext(ctx, r.r.Storer, fromHash, toHash, func(entry treeDiffChange) error {
 		if opts.PathFilter != nil && !opts.PathFilter(entry.Path) {
 			return nil
 		}
