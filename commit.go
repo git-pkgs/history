@@ -17,9 +17,7 @@ type objectID [sha256.Size]byte
 
 const rawObjectBufferSize = 8 << 10
 
-// RawObjectReaderPool is a shared bufio.Reader pool sized for streaming raw
-// git objects. Callers that decode objects themselves may borrow from it.
-var RawObjectReaderPool = sync.Pool{
+var rawObjectReaderPool = sync.Pool{
 	New: func() any { return bufio.NewReaderSize(nil, rawObjectBufferSize) },
 }
 
@@ -52,7 +50,7 @@ func visitCommitTrees(r *gogit.Repository, roots []plumbing.Hash, boundary map[p
 		if _, ok := seen[hash]; ok {
 			continue
 		}
-		tree, err := ReadCommitTreeAndParents(r, hash, !boundary[hash], &stack)
+		tree, err := readCommitTreeAndParents(r, hash, !boundary[hash], &stack)
 		if err != nil {
 			return err
 		}
@@ -64,9 +62,7 @@ func visitCommitTrees(r *gogit.Repository, roots []plumbing.Hash, boundary map[p
 	return nil
 }
 
-// ReadCommitTreeAndParents decodes only the tree and parent headers from a
-// commit object without allocating an object.Commit.
-func ReadCommitTreeAndParents(r *gogit.Repository, hash plumbing.Hash, includeParents bool, parents *[]plumbing.Hash) (tree plumbing.Hash, resultErr error) {
+func readCommitTreeAndParents(r *gogit.Repository, hash plumbing.Hash, includeParents bool, parents *[]plumbing.Hash) (tree plumbing.Hash, resultErr error) {
 	encoded, err := r.Storer.EncodedObject(plumbing.CommitObject, hash)
 	if err != nil {
 		return tree, err
@@ -88,11 +84,11 @@ func ReadCommitTreeAndParents(r *gogit.Repository, hash plumbing.Hash, includePa
 			resultErr = err
 		}
 	}()
-	buffer := RawObjectReaderPool.Get().(*bufio.Reader)
+	buffer := rawObjectReaderPool.Get().(*bufio.Reader)
 	buffer.Reset(reader)
 	defer func() {
 		buffer.Reset(nil)
-		RawObjectReaderPool.Put(buffer)
+		rawObjectReaderPool.Put(buffer)
 	}()
 
 	line, readErr := buffer.ReadSlice('\n')
@@ -104,7 +100,7 @@ func ReadCommitTreeAndParents(r *gogit.Repository, hash plumbing.Hash, includePa
 	if !ok {
 		return tree, fmt.Errorf("commit %s has no leading tree header", hash)
 	}
-	tree, err = ParseCommitObjectID(value, hash.Size())
+	tree, err = parseCommitObjectID(value, hash.Size())
 	if err != nil {
 		return tree, fmt.Errorf("commit %s tree: %w", hash, err)
 	}
@@ -122,7 +118,7 @@ func ReadCommitTreeAndParents(r *gogit.Repository, hash plumbing.Hash, includePa
 		if !ok {
 			return tree, nil
 		}
-		parent, err := ParseCommitObjectID(value, hash.Size())
+		parent, err := parseCommitObjectID(value, hash.Size())
 		if err != nil {
 			return tree, fmt.Errorf("commit %s parent: %w", hash, err)
 		}
@@ -148,7 +144,7 @@ func (w *commitLinksWriter) Write(data []byte) (int, error) {
 	if !ok {
 		return 0, fmt.Errorf("commit %s has no leading tree header", w.hash)
 	}
-	tree, err := ParseCommitObjectID(value, w.hash.Size())
+	tree, err := parseCommitObjectID(value, w.hash.Size())
 	if err != nil {
 		return 0, fmt.Errorf("commit %s tree: %w", w.hash, err)
 	}
@@ -159,7 +155,7 @@ func (w *commitLinksWriter) Write(data []byte) (int, error) {
 		if !ok {
 			break
 		}
-		parent, err := ParseCommitObjectID(value, w.hash.Size())
+		parent, err := parseCommitObjectID(value, w.hash.Size())
 		if err != nil {
 			return 0, fmt.Errorf("commit %s parent: %w", w.hash, err)
 		}
@@ -171,8 +167,7 @@ func (w *commitLinksWriter) Write(data []byte) (int, error) {
 	return len(data), nil
 }
 
-// ParseCommitObjectID decodes a hex object ID of the given byte size.
-func ParseCommitObjectID(value []byte, size int) (plumbing.Hash, error) {
+func parseCommitObjectID(value []byte, size int) (plumbing.Hash, error) {
 	if len(value) != hex.EncodedLen(size) {
 		return plumbing.ZeroHash, fmt.Errorf("invalid object ID %q", value)
 	}

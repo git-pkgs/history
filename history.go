@@ -1,6 +1,6 @@
 // Package history walks the full commit history and blob store of a git
 // repository using go-git, without invoking the git binary. It is the shared
-// object-graph layer under git-spdx and secrets.
+// object-graph layer shared by secrets, git-spdx, and git-pkgs.
 package history
 
 import "github.com/go-git/go-git/v6/plumbing/cache"
@@ -56,11 +56,24 @@ func DefaultTuning() Tuning {
 	}
 }
 
-// Options controls a single walk.
-type Options struct {
-	// Merges includes merge commits in WalkChanges output.
+// ChangeOptions controls a change walk.
+type ChangeOptions struct {
+	// Merges includes merge commits in the output.
 	Merges bool
-	// Workers is the number of concurrent reader/differ goroutines. Zero means one.
+	// Workers is the number of concurrent commit readers and diff workers.
+	Workers int
+}
+
+func (o ChangeOptions) workers() int {
+	if o.Workers < 1 {
+		return 1
+	}
+	return o.Workers
+}
+
+// BlobOptions controls a blob walk.
+type BlobOptions struct {
+	// Workers is the number of concurrent object readers.
 	Workers int
 	// Limit returns the maximum size to read for a blob; larger blobs are
 	// reported to Skip and not visited. Nil means no limit.
@@ -69,21 +82,21 @@ type Options struct {
 	Skip func(oid string)
 }
 
-func (o Options) workers() int {
+func (o BlobOptions) workers() int {
 	if o.Workers < 1 {
 		return 1
 	}
 	return o.Workers
 }
 
-func (o Options) limit(oid string) int64 {
+func (o BlobOptions) limit(oid string) int64 {
 	if o.Limit == nil {
 		return 1<<63 - 1
 	}
 	return o.Limit(oid)
 }
 
-func (o Options) skip(oid string) {
+func (o BlobOptions) skip(oid string) {
 	if o.Skip != nil {
 		o.Skip(oid)
 	}

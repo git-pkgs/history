@@ -11,9 +11,9 @@ import (
 )
 
 // WalkChangesGit produces the same Change stream as Repo.WalkChanges by
-// shelling out to the git binary. Use it for repositories the go-git backend
-// refuses (alternates, grafts, replace refs).
-func WalkChangesGit(repo string, merges bool, visit func(Change)) error {
+// shelling out to the git binary. It is also a benchmark baseline for the
+// in-process walker.
+func WalkChangesGit(repo string, merges bool, visit func(Change) error) error {
 	mergeMode := "off"
 	if merges {
 		mergeMode = "first-parent"
@@ -40,7 +40,7 @@ func WalkChangesGit(repo string, merges bool, visit func(Change)) error {
 	return waitErr
 }
 
-func readGitChanges(input io.Reader, visit func(Change)) error {
+func readGitChanges(input io.Reader, visit func(Change) error) error {
 	r := bufio.NewReaderSize(input, readerBufferSize)
 	field := func() (string, error) {
 		s, err := r.ReadString(0)
@@ -83,7 +83,9 @@ func readGitChanges(input io.Reader, visit func(Change)) error {
 		if c.Path, err = field(); err != nil {
 			return err
 		}
-		visit(c)
+		if err := visit(c); err != nil {
+			return err
+		}
 	}
 }
 

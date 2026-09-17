@@ -107,47 +107,10 @@ func (n *shallowCommitNode) ParentNode(int) (commitgraph.CommitNode, error) { //
 }
 func (n *shallowCommitNode) ParentHashes() []plumbing.Hash { return nil }
 
-type treeLoad struct {
-	ready chan struct{}
-	tree  *object.Tree
-	err   error
-}
-
-type treeCache struct {
-	mu    sync.Mutex
-	trees map[plumbing.Hash]*treeLoad
-}
-
-func newTreeCache() *treeCache {
-	return &treeCache{trees: make(map[plumbing.Hash]*treeLoad)}
-}
-
-func (c *treeCache) load(hash plumbing.Hash, load func() (*object.Tree, error)) (*object.Tree, error) {
-	c.mu.Lock()
-	entry := c.trees[hash]
-	if entry == nil {
-		entry = &treeLoad{ready: make(chan struct{})}
-		c.trees[hash] = entry
-		c.mu.Unlock()
-		entry.tree, entry.err = load()
-		close(entry.ready)
-		return entry.tree, entry.err
-	}
-	c.mu.Unlock()
-	<-entry.ready
-	return entry.tree, entry.err
-}
-
-func (c *treeCache) release(hash plumbing.Hash) {
-	c.mu.Lock()
-	delete(c.trees, hash)
-	c.mu.Unlock()
-}
-
 // WalkChanges visits every file-level change in date order across all refs.
 // visit is called from a single goroutine in commit order regardless of
 // opts.Workers.
-func (r *Repo) WalkChanges(opts Options, visit func(Change)) error {
+func (r *Repo) WalkChanges(opts ChangeOptions, visit func(Change) error) error {
 	rootHashes, err := historyRoots(r.r)
 	if err != nil {
 		return err
@@ -186,9 +149,8 @@ func (r *Repo) WalkChanges(opts Options, visit func(Change)) error {
 	if _, err := iter.Next(); err != nil {
 		return err
 	}
-	cache := newTreeCache()
 	if opts.workers() > 1 {
-		return visitChangesParallel(iter, cache, opts.Merges, visit, opts.workers())
+		return r.visitChangesParallel(iter, opts.Merges, visit, opts.workers())
 	}
 	for {
 		node, err := iter.Next()
@@ -199,69 +161,52 @@ func (r *Repo) WalkChanges(opts Options, visit func(Change)) error {
 			return err
 		}
 		if opts.Merges || node.NumParents() < 2 {
-			if err := visitCommitNodeChanges(context.Background(), node, cache, visit); err != nil {
+			if err := r.visitCommitNodeChanges(context.Background(), node, visit); err != nil {
 				return err
 			}
 		}
-		cache.release(node.ID())
 	}
 }
 
-func visitCommitNodeChanges(ctx context.Context, node commitgraph.CommitNode, cache *treeCache, visit func(Change)) error {
+func (r *Repo) visitCommitNodeChanges(ctx context.Context, node commitgraph.CommitNode, visit func(Change) error) error {
 	commit, err := node.Commit()
 	if err != nil {
 		return err
 	}
-	to, err := cache.load(node.ID(), node.Tree)
-	if err != nil {
-		return err
-	}
-	var from *object.Tree
+	to := commit.TreeHash
+	from := plumbing.ZeroHash
 	parents := node.ParentHashes()
 	if len(parents) > 0 {
 		parent, err := node.ParentNode(0)
 		if err != nil {
 			return err
 		}
-		from, err = cache.load(parents[0], parent.Tree)
+		parentCommit, err := parent.Commit()
 		if err != nil {
 			return err
 		}
-	}
-	changes, err := object.DiffTreeContext(ctx, from, to)
-	if err != nil {
-		return err
-	}
-	if len(changes) == 0 {
-		return nil
+		from = parentCommit.TreeHash
 	}
 	hash := node.ID().String()
 	zero := strings.Repeat("0", len(hash))
 	date := commit.Author.When.Format(time.RFC3339)
 	subject := CommitSubject(commit.Message)
 	merge := len(parents) > 1
-	for _, entry := range changes {
-		path := entry.To.Name
-		if path == "" {
-			path = entry.From.Name
+	return object.WalkTreeDiffContext(ctx, r.r.Storer, from, to, func(entry object.TreeDiffChange) error {
+		oldOID, newOID := zero, zero
+		if !entry.From.Hash.IsZero() {
+			oldOID = entry.From.Hash.String()
 		}
-		oldOID := formatOID(entry.From.TreeEntry, zero)
-		newOID := formatOID(entry.To.TreeEntry, zero)
-		visit(Change{
+		if !entry.To.Hash.IsZero() {
+			newOID = entry.To.Hash.String()
+		}
+		return visit(Change{
 			Commit: hash, Date: date, Subject: subject,
-			Path: path, OldOID: oldOID, NewOID: newOID,
-			OldMode: formatMode(entry.From.TreeEntry.Mode), NewMode: formatMode(entry.To.TreeEntry.Mode),
+			Path: entry.Path, OldOID: oldOID, NewOID: newOID,
+			OldMode: formatMode(entry.From.Mode), NewMode: formatMode(entry.To.Mode),
 			Merge: merge,
 		})
-	}
-	return nil
-}
-
-func formatOID(entry object.TreeEntry, zero string) string {
-	if entry.Mode == 0 {
-		return zero
-	}
-	return entry.Hash.String()
+	})
 }
 
 func formatMode(mode filemode.FileMode) string {
@@ -281,7 +226,7 @@ type streamTask struct {
 	result chan changesResult
 }
 
-func visitChangesParallel(iter commitgraph.CommitNodeIter, cache *treeCache, merges bool, visit func(Change), workers int) error {
+func (r *Repo) visitChangesParallel(iter commitgraph.CommitNodeIter, merges bool, visit func(Change) error, workers int) error {
 	ctx, cancel := context.WithCancel(context.Background())
 	tasks := make(chan streamTask, workers)
 	var wg sync.WaitGroup
@@ -295,8 +240,9 @@ func visitChangesParallel(iter commitgraph.CommitNodeIter, cache *treeCache, mer
 			for task := range tasks {
 				var result changesResult
 				if !task.skip {
-					result.err = visitCommitNodeChanges(ctx, task.node, cache, func(c Change) {
+					result.err = r.visitCommitNodeChanges(ctx, task.node, func(c Change) error {
 						result.changes = append(result.changes, c)
+						return nil
 					})
 				}
 				task.result <- result
@@ -336,9 +282,10 @@ func visitChangesParallel(iter commitgraph.CommitNodeIter, cache *treeCache, mer
 			return result.err
 		}
 		for _, c := range result.changes {
-			visit(c)
+			if err := visit(c); err != nil {
+				return err
+			}
 		}
-		cache.release(task.node.ID())
 		pending = pending[1:]
 		if err := fill(); err != nil {
 			return err

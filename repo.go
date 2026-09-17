@@ -8,6 +8,7 @@ import (
 	"path/filepath"
 	"strings"
 
+	"github.com/go-git/go-billy/v6"
 	"github.com/go-git/go-billy/v6/osfs"
 	gogit "github.com/go-git/go-git/v6"
 	"github.com/go-git/go-git/v6/plumbing"
@@ -19,29 +20,63 @@ import (
 
 // Repo wraps an open go-git repository configured for history walking.
 type Repo struct {
-	r *gogit.Repository
-	t Tuning
+	r         *gogit.Repository
+	t         Tuning
+	gitDir    string
+	commonDir string
 }
 
-// Open opens the repository at path, refusing configurations go-git cannot
-// walk correctly (alternate object stores, grafts, replace refs).
-func Open(path string, t Tuning) (*Repo, error) {
+// OpenOptions controls repository discovery and storage.
+type OpenOptions struct {
+	Tuning       Tuning
+	DetectDotGit bool
+	AlternatesFS billy.Filesystem
+}
+
+// Open opens the repository at path with the default tuning.
+func Open(path string) (*Repo, error) {
+	return OpenWithOptions(path, OpenOptions{Tuning: DefaultTuning()})
+}
+
+// OpenWithOptions opens the repository at path with repository discovery and
+// alternate-object storage options.
+func OpenWithOptions(path string, opts OpenOptions) (*Repo, error) {
 	for _, name := range []string{"GIT_OBJECT_DIRECTORY", "GIT_ALTERNATE_OBJECT_DIRECTORIES"} {
 		if os.Getenv(name) != "" {
 			return nil, fmt.Errorf("history: go-git does not support %s", name)
 		}
 	}
-	if t.KlauspostZlib {
+	if opts.Tuning.KlauspostZlib {
 		if err := useKlauspostZlib(); err != nil {
 			return nil, err
 		}
 	}
-	r, err := gogit.PlainOpen(path)
+	alternatesFS := opts.AlternatesFS
+	if alternatesFS == nil {
+		abs, err := filepath.Abs(path)
+		if err != nil {
+			return nil, err
+		}
+		root := filepath.VolumeName(abs) + string(filepath.Separator)
+		if opts.Tuning.Mmap {
+			alternatesFS = osfs.New(root, osfs.WithBoundOS(), osfs.WithMmap())
+		} else {
+			alternatesFS = osfs.New(root)
+		}
+	}
+	r, err := gogit.PlainOpenWithOptions(path, &gogit.PlainOpenOptions{
+		DetectDotGit: opts.DetectDotGit,
+		AlternatesFS: alternatesFS,
+	})
 	if err != nil {
 		return nil, err
 	}
+	if err := rejectReplacementRefs(r); err != nil {
+		_ = r.Close()
+		return nil, err
+	}
 	fs := r.Storer.(*filesystem.Storage).Filesystem()
-	for _, name := range []string{"objects/info/alternates", "info/grafts"} {
+	for _, name := range []string{"info/grafts"} {
 		f, err := fs.Open(name)
 		if errors.Is(err, os.ErrNotExist) {
 			continue
@@ -62,11 +97,16 @@ func Open(path string, t Tuning) (*Repo, error) {
 			return nil, err
 		}
 	}
-	if err := configure(r, t); err != nil {
+	gitDir, commonDir, err := repositoryDirs(r)
+	if err != nil {
 		_ = r.Close()
 		return nil, err
 	}
-	return &Repo{r: r, t: t}, nil
+	if err := configure(r, opts.Tuning, alternatesFS); err != nil {
+		_ = r.Close()
+		return nil, err
+	}
+	return &Repo{r: r, t: opts.Tuning, gitDir: gitDir, commonDir: commonDir}, nil
 }
 
 // Close releases the underlying go-git repository.
@@ -75,6 +115,12 @@ func (r *Repo) Close() error { return r.r.Close() }
 // Repository returns the underlying go-git handle for callers that need
 // direct storer access.
 func (r *Repo) Repository() *gogit.Repository { return r.r }
+
+// GitDir returns the worktree-specific Git directory.
+func (r *Repo) GitDir() string { return r.gitDir }
+
+// CommonDir returns the Git directory shared by linked worktrees.
+func (r *Repo) CommonDir() string { return r.commonDir }
 
 // Shallow reports whether the repository is a shallow clone.
 func (r *Repo) Shallow() (bool, error) {
@@ -87,7 +133,40 @@ func (r *Repo) Roots() ([]plumbing.Hash, error) {
 	return historyRoots(r.r)
 }
 
-func configure(r *gogit.Repository, t Tuning) error {
+func repositoryDirs(r *gogit.Repository) (string, string, error) {
+	storage, ok := r.Storer.(*filesystem.Storage)
+	if !ok {
+		return "", "", fmt.Errorf("history: unsupported storage %T", r.Storer)
+	}
+	fs := storage.Filesystem()
+	objects, err := fs.Chroot("objects")
+	if err != nil {
+		return "", "", err
+	}
+	return filepath.Clean(fs.Root()), filepath.Clean(filepath.Dir(objects.Root())), nil
+}
+
+func rejectReplacementRefs(r *gogit.Repository) error {
+	refs, err := r.References()
+	if err != nil {
+		return err
+	}
+	defer refs.Close()
+	for {
+		ref, err := refs.Next()
+		if err == io.EOF {
+			return nil
+		}
+		if err != nil {
+			return err
+		}
+		if strings.HasPrefix(ref.Name().String(), "refs/replace/") {
+			return fmt.Errorf("history: go-git does not support replacement refs")
+		}
+	}
+}
+
+func configure(r *gogit.Repository, t Tuning, alternatesFS billy.Filesystem) error {
 	if t.CacheBytes == 0 {
 		t.CacheBytes = uint64(cache.DefaultMaxSize)
 	}
@@ -113,6 +192,7 @@ func configure(r *gogit.Repository, t Tuning) error {
 		objectCache = cache.NewShardedObjectLRU(cache.FileSize(t.CacheBytes), t.CacheShards)
 	}
 	r.Storer = filesystem.NewStorageWithOptions(fs, objectCache, filesystem.Options{
+		AlternatesFS:   alternatesFS,
 		UseInMemoryIdx: t.MemoryIndex,
 	})
 	return nil
@@ -148,9 +228,6 @@ func historyRoots(r *gogit.Repository) ([]plumbing.Hash, error) {
 		}
 		if !strings.HasPrefix(ref.Name().String(), "refs/") {
 			continue
-		}
-		if strings.HasPrefix(ref.Name().String(), "refs/replace/") {
-			return nil, fmt.Errorf("history: go-git does not support replacement refs")
 		}
 		resolved, err := r.Reference(ref.Name(), true)
 		if err != nil {

@@ -14,8 +14,8 @@ github.com/emirpasic/gods v1.18.1 h1:FXtiHYKDGKCW2KzwZKx0iC0PQmdlorYgdFG9jPXJ1Bc
 github.com/emirpasic/gods v1.18.1/go.mod h1:8tpGGwCnJ5H4r6BWwaV6OrWmMoPhUl5jm/FMNAnJvWQ=
 github.com/git-pkgs/go-billy/v6 v6.0.0-alpha.2.0.20260906202738-23c9d86c8d17 h1:PzXJag1pssE3Hhl/tccdaPOtz5j2eZyl1WyUmai71FU=
 github.com/git-pkgs/go-billy/v6 v6.0.0-alpha.2.0.20260906202738-23c9d86c8d17/go.mod h1:QGOWN4CzmtRfpFeCw5paG3RJyKdTwsfGASkxBVkIaAU=
-github.com/git-pkgs/go-git/v6 v6.0.0-alpha.4.0.20260906204421-52ea7303c392 h1:V4/D19lZAHihN/jCHa5lIL6BobOjhTkWFtsOnq/bhYU=
-github.com/git-pkgs/go-git/v6 v6.0.0-alpha.4.0.20260906204421-52ea7303c392/go.mod h1:2eK2w/x2zu4GWIHvrPUnxOTKkQ1H9Hm40hDPLl1az9Q=
+github.com/git-pkgs/go-git/v6 v6.0.0-alpha.4.0.20260917090817-072a44546c43 h1:Ya3MM+wWrv8WmT/dMDlHmLZ9UMV3OW9uTYiB+L6ocqs=
+github.com/git-pkgs/go-git/v6 v6.0.0-alpha.4.0.20260917090817-072a44546c43/go.mod h1:2eK2w/x2zu4GWIHvrPUnxOTKkQ1H9Hm40hDPLl1az9Q=
 github.com/gliderlabs/ssh v0.3.8 h1:a4YXD1V7xMF9g5nTkdfnja3Sxy1PVDCj1Zg4Wb8vY6c=
 github.com/gliderlabs/ssh v0.3.8/go.mod h1:xYoytBv1sV0aL3CavoDuJIQNURXkkfPA/wxQ1pL1fAU=
 github.com/go-git/gcfg/v2 v2.0.2 h1:MY5SIIfTGGEMhdA7d7JePuVVxtKL7Hp+ApGDJAJ7dpo=

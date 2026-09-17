@@ -19,14 +19,14 @@ type blobTask struct {
 // invokes visit from opts.Workers goroutines concurrently. visit must be
 // safe for concurrent use. The returned int is the total blob count
 // including those excluded by opts.Limit.
-func (r *Repo) WalkBlobs(opts Options, visit func(Blob) error) (int, error) {
+func (r *Repo) WalkBlobs(opts BlobOptions, visit func(Blob) error) (int, error) {
 	if r.t.ObjectInfos {
 		return r.walkBlobsObjectInfos(opts, visit)
 	}
 	return r.walkBlobsObjects(opts, visit)
 }
 
-func (r *Repo) walkBlobsObjectInfos(opts Options, visit func(Blob) error) (int, error) {
+func (r *Repo) walkBlobsObjectInfos(opts BlobOptions, visit func(Blob) error) (int, error) {
 	storage, ok := r.r.Storer.(*filesystem.Storage)
 	if !ok {
 		return 0, fmt.Errorf("history: filesystem storage required for ObjectInfos")
@@ -89,7 +89,7 @@ func visitObjectInfo(reader *filesystem.ObjectInfoReader, task blobTask, visit f
 	return visit(Blob{OID: task.oid, Size: task.info.Size, Data: data})
 }
 
-func enumerateObjectInfos(ctx context.Context, iter filesystem.ObjectInfoIter, opts Options, batchSize int, tasks chan<- []blobTask) (int, error) {
+func enumerateObjectInfos(ctx context.Context, iter filesystem.ObjectInfoIter, opts BlobOptions, batchSize int, tasks chan<- []blobTask) (int, error) {
 	total := 0
 	batch := make([]blobTask, 0, batchSize)
 	flush := func() bool {
@@ -126,7 +126,7 @@ func enumerateObjectInfos(ctx context.Context, iter filesystem.ObjectInfoIter, o
 	}
 }
 
-func (r *Repo) walkBlobsObjects(opts Options, visit func(Blob) error) (int, error) {
+func (r *Repo) walkBlobsObjects(opts BlobOptions, visit func(Blob) error) (int, error) {
 	iter, err := r.r.Storer.IterEncodedObjects(plumbing.BlobObject)
 	if err != nil {
 		return 0, err
