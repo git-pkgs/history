@@ -2,6 +2,7 @@ package history
 
 import (
 	"bufio"
+	"bytes"
 	"fmt"
 	"io"
 
@@ -64,6 +65,10 @@ func (r *Repo) WalkTreeEntries(hash plumbing.Hash, visit func(TreeEntry) error) 
 		name = name[:len(name)-1]
 		if len(name) == 0 {
 			return fmt.Errorf("tree %s has an empty filename", hash)
+		}
+		if buffer.Buffered() < hash.Size() {
+			// Peek may overwrite the filename when it refills the buffer.
+			name = bytes.Clone(name)
 		}
 		oidBytes, err := buffer.Peek(hash.Size())
 		if err != nil {
