@@ -87,4 +87,4 @@ The returned count includes blobs excluded by `Limit`. Use `Skip` when the calle
 
 ## License
 
-MIT
+[MIT](LICENSE).
