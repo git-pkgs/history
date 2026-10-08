@@ -3,7 +3,7 @@ module github.com/git-pkgs/history
 go 1.26.0
 
 require (
-	github.com/go-git/go-billy/v6 v6.0.0-alpha.2
+	github.com/go-git/go-billy/v6 v6.0.0-beta.1
 	github.com/go-git/go-git/v6 v6.0.0-alpha.5
 	github.com/klauspost/compress v1.20.0
 )
