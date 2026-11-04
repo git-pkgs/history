@@ -154,16 +154,24 @@ func (s *TreeFS) entries(hash plumbing.Hash) ([]cachedTreeEntry, error) {
 		<-load.ready
 		return load.entries, load.err
 	}
+	completed := false
+	defer func() {
+		if !completed {
+			load.entries = nil
+			load.err = errors.New("tree entry load aborted")
+		}
+		if load.err != nil {
+			load.entries = nil
+			s.treeEntries.Delete(hash)
+		}
+		close(load.ready)
+	}()
 	load.entries = make([]cachedTreeEntry, 0)
 	load.err = s.walkTreeEntries(hash, func(child TreeEntry) error {
 		load.entries = append(load.entries, cachedTreeEntry{name: string(child.Name), hash: child.Hash, mode: child.Mode})
 		return nil
 	})
-	if load.err != nil {
-		load.entries = nil
-		s.treeEntries.Delete(hash)
-	}
-	close(load.ready)
+	completed = true
 	return load.entries, load.err
 }
 
