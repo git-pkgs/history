@@ -8,6 +8,7 @@ import (
 	"path"
 	"slices"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 
@@ -25,8 +26,9 @@ import (
 // need not be present. Modes reflect Git permissions, modification times
 // are zero, directory sizes are zero, and FileInfo.Sys returns nil.
 type TreeFS struct {
-	repo *Repo
-	root plumbing.Hash
+	repo        *Repo
+	root        plumbing.Hash
+	treeEntries sync.Map
 }
 
 // TreeFS returns a filesystem for a commit or tree hash without a worktree.
@@ -105,17 +107,18 @@ func (s *TreeFS) lookup(name string) (treeDirEntry, error) {
 		if entry.mode == filemode.Submodule {
 			return entry, fs.ErrNotExist
 		}
-		var found bool
-		var next treeDirEntry
-		err := s.repo.WalkTreeEntries(entry.hash, func(child TreeEntry) error {
-			if string(child.Name) == part {
-				next = treeDirEntry{snapshot: s, name: path.Join(entry.name, part), hash: child.Hash, mode: child.Mode}
-				found = true
-			}
-			return nil
-		})
+		children, err := s.entries(entry.hash)
 		if err != nil {
 			return entry, err
+		}
+		var found bool
+		var next treeDirEntry
+		for _, child := range children {
+			if child.name == part {
+				next = treeDirEntry{snapshot: s, name: path.Join(entry.name, part), hash: child.hash, mode: child.mode}
+				found = true
+				break
+			}
 		}
 		if !found {
 			return entry, fs.ErrNotExist
@@ -123,6 +126,28 @@ func (s *TreeFS) lookup(name string) (treeDirEntry, error) {
 		entry = next
 	}
 	return entry, nil
+}
+
+type cachedTreeEntry struct {
+	name string
+	hash plumbing.Hash
+	mode filemode.FileMode
+}
+
+func (s *TreeFS) entries(hash plumbing.Hash) ([]cachedTreeEntry, error) {
+	if cached, ok := s.treeEntries.Load(hash); ok {
+		return cached.([]cachedTreeEntry), nil
+	}
+	entries := make([]cachedTreeEntry, 0)
+	err := s.repo.WalkTreeEntries(hash, func(child TreeEntry) error {
+		entries = append(entries, cachedTreeEntry{name: string(child.Name), hash: child.Hash, mode: child.Mode})
+		return nil
+	})
+	if err != nil {
+		return nil, err
+	}
+	actual, _ := s.treeEntries.LoadOrStore(hash, entries)
+	return actual.([]cachedTreeEntry), nil
 }
 
 type treeDirEntry struct {
@@ -238,18 +263,17 @@ func (f *treeFile) ReadDir(n int) ([]fs.DirEntry, error) {
 func (f *treeFile) loadEntries() error {
 	entries := make([]fs.DirEntry, 0)
 	if f.entry.mode != filemode.Submodule {
-		err := f.entry.snapshot.repo.WalkTreeEntries(f.entry.hash, func(child TreeEntry) error {
-			name := string(child.Name)
-			if !fs.ValidPath(name) || name == "." || strings.Contains(name, "/") || child.Mode.IsMalformed() {
-				return fmt.Errorf("%w: invalid tree entry %q (mode %s)", fs.ErrInvalid, name, child.Mode)
-			}
-			entries = append(entries, treeDirEntry{
-				snapshot: f.entry.snapshot, name: path.Join(f.entry.name, name), hash: child.Hash, mode: child.Mode,
-			})
-			return nil
-		})
+		children, err := f.entry.snapshot.entries(f.entry.hash)
 		if err != nil {
 			return err
+		}
+		for _, child := range children {
+			if !fs.ValidPath(child.name) || child.name == "." || strings.Contains(child.name, "/") || child.mode.IsMalformed() {
+				return fmt.Errorf("%w: invalid tree entry %q (mode %s)", fs.ErrInvalid, child.name, child.mode)
+			}
+			entries = append(entries, treeDirEntry{
+				snapshot: f.entry.snapshot, name: path.Join(f.entry.name, child.name), hash: child.hash, mode: child.mode,
+			})
 		}
 	}
 	slices.SortFunc(entries, func(a, b fs.DirEntry) int { return strings.Compare(a.Name(), b.Name()) })

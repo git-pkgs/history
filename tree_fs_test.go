@@ -375,6 +375,32 @@ func TestTreeFSConcurrent(t *testing.T) {
 	}
 }
 
+func TestTreeFSRepeatedLookup(t *testing.T) {
+	fixture := newSnapshotFixture(t, "sha1")
+	repo, err := history.OpenWithOptions(fixture.dir, history.OpenOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		if err := repo.Close(); err != nil {
+			t.Error(err)
+		}
+	})
+	snapshot, err := repo.TreeFS(fixture.commit)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for range 20 {
+		info, err := fs.Stat(snapshot, snapshotNested)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if info.IsDir() || info.Size() == 0 {
+			t.Fatalf("nested info: %+v", info)
+		}
+	}
+}
+
 func checkSnapshotTuning(t *testing.T, fixture snapshotFixture, tuning history.Tuning) {
 	t.Helper()
 	repo, err := history.OpenWithOptions(fixture.dir, history.OpenOptions{Tuning: tuning})
