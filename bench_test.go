@@ -1,6 +1,7 @@
 package history
 
 import (
+	"io/fs"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -170,6 +171,40 @@ func BenchmarkWalkCommitsExact(b *testing.B) {
 			}
 			b.ReportMetric(float64(commits)/float64(b.N), "commits/op")
 			b.ReportMetric(float64(changes)/float64(b.N), "changes/op")
+		})
+	}
+}
+
+func BenchmarkTreeFSReadDir(b *testing.B) {
+	for _, path := range benchmarkRepositories(b) {
+		b.Run(filepath.Base(path), func(b *testing.B) {
+			repo, err := Open(path)
+			if err != nil {
+				b.Fatal(err)
+			}
+			b.Cleanup(func() {
+				if err := repo.Close(); err != nil {
+					b.Error(err)
+				}
+			})
+			head, err := repo.Repository().Head()
+			if err != nil {
+				b.Fatal(err)
+			}
+			snapshot, err := repo.TreeFS(head.Hash())
+			if err != nil {
+				b.Fatal(err)
+			}
+			var entries int
+			b.ResetTimer()
+			for b.Loop() {
+				listed, err := fs.ReadDir(snapshot, ".")
+				if err != nil {
+					b.Fatal(err)
+				}
+				entries += len(listed)
+			}
+			b.ReportMetric(float64(entries)/float64(b.N), "entries/op")
 		})
 	}
 }
