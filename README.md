@@ -81,6 +81,22 @@ count, err := repo.WalkBlobs(history.BlobOptions{
 
 The returned count includes blobs excluded by `Limit`. Use `Skip` when the caller needs their object IDs.
 
+### Read a snapshot
+
+`TreeFS` accepts a commit or tree hash and returns a read-only `fs.FS`. It supports `fs.ReadFile`, `fs.ReadDir`, `fs.Stat`, `fs.Glob`, and `fs.WalkDir` without a worktree.
+
+```go
+snapshot, err := repo.TreeFS(hash)
+if err != nil {
+	return err
+}
+data, err := fs.ReadFile(snapshot, "README.md")
+```
+
+Import `io/fs` for these helpers. Paths use slash separators relative to the snapshot root, with `.` for the root directory. Symlinks return their stored target text when read and report `fs.ModeSymlink`; they are never followed. Submodules appear as empty directories, even when their commits are absent locally.
+
+Reads can run concurrently through the repository's configured object store and cache. Keep the repository open while using a snapshot or its files, and use separate file handles in each goroutine. File modes reflect Git permissions, modification times and directory sizes are zero, and `FileInfo.Sys()` returns nil. Annotated tag hashes must be resolved to commits or trees before calling `TreeFS`.
+
 ### Open options
 
 `Open` uses the package's benchmarked storage defaults. `OpenWithOptions` exposes repository discovery, storage tuning, and an alternate-object filesystem for callers that need different behaviour.
