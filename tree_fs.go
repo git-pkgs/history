@@ -26,9 +26,10 @@ import (
 // need not be present. Modes reflect Git permissions, modification times
 // are zero, directory sizes are zero, and FileInfo.Sys returns nil.
 type TreeFS struct {
-	repo        *Repo
-	root        plumbing.Hash
-	treeEntries sync.Map
+	repo            *Repo
+	root            plumbing.Hash
+	treeEntries     sync.Map
+	walkTreeEntries func(plumbing.Hash, func(TreeEntry) error) error
 }
 
 // TreeFS returns a filesystem for a commit or tree hash without a worktree.
@@ -52,7 +53,7 @@ func (r *Repo) TreeFS(hash plumbing.Hash) (*TreeFS, error) {
 	if err != nil {
 		return nil, treePathError("treefs", hash.String(), err)
 	}
-	return &TreeFS{repo: r, root: root}, nil
+	return &TreeFS{repo: r, root: root, walkTreeEntries: r.WalkTreeEntries}, nil
 }
 
 // Open opens a file or directory relative to the snapshot root.
@@ -134,20 +135,36 @@ type cachedTreeEntry struct {
 	mode filemode.FileMode
 }
 
+type treeEntryLoad struct {
+	ready   chan struct{}
+	entries []cachedTreeEntry
+	err     error
+}
+
 func (s *TreeFS) entries(hash plumbing.Hash) ([]cachedTreeEntry, error) {
 	if cached, ok := s.treeEntries.Load(hash); ok {
-		return cached.([]cachedTreeEntry), nil
+		load := cached.(*treeEntryLoad)
+		<-load.ready
+		return load.entries, load.err
 	}
-	entries := make([]cachedTreeEntry, 0)
-	err := s.repo.WalkTreeEntries(hash, func(child TreeEntry) error {
-		entries = append(entries, cachedTreeEntry{name: string(child.Name), hash: child.Hash, mode: child.Mode})
+	load := &treeEntryLoad{ready: make(chan struct{})}
+	actual, loaded := s.treeEntries.LoadOrStore(hash, load)
+	load = actual.(*treeEntryLoad)
+	if loaded {
+		<-load.ready
+		return load.entries, load.err
+	}
+	load.entries = make([]cachedTreeEntry, 0)
+	load.err = s.walkTreeEntries(hash, func(child TreeEntry) error {
+		load.entries = append(load.entries, cachedTreeEntry{name: string(child.Name), hash: child.Hash, mode: child.Mode})
 		return nil
 	})
-	if err != nil {
-		return nil, err
+	if load.err != nil {
+		load.entries = nil
+		s.treeEntries.Delete(hash)
 	}
-	actual, _ := s.treeEntries.LoadOrStore(hash, entries)
-	return actual.([]cachedTreeEntry), nil
+	close(load.ready)
+	return load.entries, load.err
 }
 
 type treeDirEntry struct {
